@@ -1,416 +1,761 @@
+use curl::easy::{Easy2, Handler, List, WriteError};
+use openssl::{pkcs12::Pkcs12, x509::X509};
 use std::collections::HashMap;
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc, Mutex,
-};
-use std::time::SystemTime;
+use std::ffi::CStr;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use curl::easy::{Easy, List};
-use lazy_static::lazy_static;
-use openssl::{pkcs12::Pkcs12, ssl::SslContextBuilder, x509::X509};
-use openssl_sys::SSL_CTX;
-use tokio_util::sync::CancellationToken;
+use crate::interop::*;
+use crate::RelayError;
 
-use crate::{
-    error::{RelayError, RelayResult},
-    interop::{
-        BodyDef, ClientCertDef, FormDataValue, KeyValuePair, RequestWithMetadata,
-        ResponseWithMetadata,
-    },
-    util::get_status_text,
-};
-
-lazy_static! {
-    static ref CANCELLED_REQUESTS: Arc<Mutex<HashMap<usize, Arc<AtomicBool>>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+struct RequestHandler {
+    headers: Vec<String>,
+    data: Vec<u8>,
+    total_bytes: u64,
+    received_bytes: u64,
+    start_time: i64,
+    callbacks: Option<SubscribeCallbacks>,
+    tls_info: Option<TlsConnectionInfo>,
+    redirect_history: Vec<RedirectInfo>,
 }
 
-pub(crate) fn run(req: RequestWithMetadata) -> RelayResult<ResponseWithMetadata> {
-    let req_id = req.req_id;
-    let cancelled = Arc::new(AtomicBool::new(false));
+struct TlsConnectionInfo {
+    protocol: String,
+    cipher: String,
+    certificates: Vec<CertificateInfo>,
+}
 
-    {
-        let mut cancelled_requests = CANCELLED_REQUESTS.lock().unwrap();
-        cancelled_requests.insert(req_id, Arc::clone(&cancelled));
+impl RequestHandler {
+    fn new(callbacks: Option<SubscribeCallbacks>) -> Self {
+        RequestHandler {
+            headers: Vec::new(),
+            data: Vec::new(),
+            total_bytes: 0,
+            received_bytes: 0,
+            start_time: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64,
+            callbacks,
+            tls_info: None,
+            redirect_history: Vec::new(),
+        }
     }
 
-    let cancel_token = CancellationToken::new();
-    let cancel_token_clone = cancel_token.clone();
-    let cancelled_clone = Arc::clone(&cancelled);
-
-    let handle = std::thread::spawn(move || {
-        let result = run_request_task(req, cancel_token);
-
-        if cancel_token_clone.is_cancelled() {
-            cancelled_clone.store(true, Ordering::SeqCst);
+    fn handle_state_change(&self, state: RequestState) {
+        if let Some(ref callbacks) = self.callbacks {
+            (callbacks.on_state_change)(StateChangeEvent { state });
         }
+    }
 
-        result
-    });
-
-    let result = match handle.join() {
-        Ok(result) => {
-            if cancelled.load(Ordering::SeqCst) {
-                Err(RelayError::RequestCancelled)
+    fn handle_progress(&self, loaded: u64, total: Option<u64>, is_upload: bool) {
+        if let Some(ref callbacks) = self.callbacks {
+            let event = if is_upload {
+                ProgressEvent::Upload { loaded, total }
             } else {
-                result
-            }
+                ProgressEvent::Download { loaded, total }
+            };
+            (callbacks.on_progress)(event);
         }
-        Err(_) => Err(RelayError::RequestRunError(
-            "Request thread panicked".to_string(),
-        )),
-    };
-
-    {
-        let mut cancelled_requests = CANCELLED_REQUESTS.lock().unwrap();
-        cancelled_requests.remove(&req_id);
     }
 
-    result
-}
+    fn handle_auth_challenge(&self, auth_type: AuthChallengeType, params: HashMap<String, String>) {
+        if let Some(ref callbacks) = self.callbacks {
+            (callbacks.on_auth_challenge)(AuthChallengeEvent {
+                r#type: auth_type,
+                params,
+            });
+        }
+    }
 
-pub(crate) fn cancel(req_id: usize) {
-    if let Some(cancelled) = CANCELLED_REQUESTS.lock().unwrap().get(&req_id) {
-        cancelled.store(true, Ordering::SeqCst);
+    fn handle_cookie(&self, event: CookieEvent) {
+        if let Some(ref callbacks) = self.callbacks {
+            (callbacks.on_cookie_received)(event);
+        }
     }
 }
 
-fn run_request_task(
-    req: RequestWithMetadata,
-    cancel_token: CancellationToken,
-) -> Result<ResponseWithMetadata, RelayError> {
-    let mut curl_handle = Easy::new();
+impl Handler for RequestHandler {
+    fn write(&mut self, data: &[u8]) -> Result<usize, WriteError> {
+        self.data.extend_from_slice(data);
+        self.received_bytes += data.len() as u64;
+        self.handle_progress(self.received_bytes, Some(self.total_bytes), false);
+        Ok(data.len())
+    }
 
-    curl_handle
-        .progress(true)
-        .map_err(|err| RelayError::RequestRunError(err.description().to_string()))?;
+    fn header(&mut self, data: &[u8]) -> bool {
+        if let Ok(s) = String::from_utf8(data.to_vec()) {
+            self.headers.push(s.trim().to_string());
 
-    curl_handle
-        .custom_request(&req.method)
-        .map_err(|_| RelayError::InvalidMethod)?;
-
-    curl_handle
-        .url(&req.endpoint)
-        .map_err(|_| RelayError::InvalidUrl)?;
-
-    let headers = get_headers_list(&req)?;
-    curl_handle
-        .http_headers(headers)
-        .map_err(|_| RelayError::InvalidHeaders)?;
-
-    apply_body_to_curl_handle(&mut curl_handle, &req)?;
-    apply_ssl_config_to_curl_handle(&mut curl_handle, &req)?;
-    apply_client_cert_to_curl_handle(&mut curl_handle, &req)?;
-    apply_proxy_config_to_curl_handle(&mut curl_handle, &req)?;
-
-    let mut response_body = Vec::new();
-    let mut response_headers = Vec::new();
-    let (start_time_ms, end_time_ms) = {
-        let mut transfer = curl_handle.transfer();
-
-        transfer
-            .ssl_ctx_function(|ssl_ctx_ptr| {
-                let cert_list = get_x509_certs_from_root_cert_bundle_safe(&req).unwrap_or_default();
-
-                if !cert_list.is_empty() {
-                    let mut ssl_ctx_builder =
-                        unsafe { SslContextBuilder::from_ptr(ssl_ctx_ptr as *mut SSL_CTX) };
-
-                    let cert_store = ssl_ctx_builder.cert_store_mut();
-
-                    for cert in cert_list.iter() {
-                        let _ = cert_store.add_cert(cert.clone());
+            // Track redirects
+            if s.starts_with("Location:") {
+                if let Some(status) = self
+                    .headers
+                    .iter()
+                    .find(|h| h.starts_with("HTTP/"))
+                    .and_then(|h| h.split_whitespace().nth(1))
+                    .and_then(|s| Some(s.parse::<u16>().unwrap()))
+                {
+                    let mut headers = HashMap::new();
+                    for header in &self.headers {
+                        if let Some((key, value)) = header.split_once(':') {
+                            headers
+                                .entry(key.trim().to_string())
+                                .or_insert_with(Vec::new)
+                                .push(value.trim().to_string());
+                        }
                     }
 
-                    // SAFETY: We need to prevent Rust from dropping the `SslContextBuilder` because
-                    // the underlying `SSL_CTX` pointer is owned and managed by curl, not us.
-                    // From curl docs: "libcurl does not guarantee the lifetime of the passed in
-                    // object once this callback function has returned"
-                    // and `SslContextBuilder` is just a safe wrapper around curl's `SSL_CTX` from
-                    // `openssl_sys::SSL_CTX`.
-                    // If dropped, Rust would try to free the `SSL_CTX` which curl still needs.
-                    //
-                    // This intentional "leak" is safe because:
-                    // - We're only leaking the thin Rust wrapper
-                    // - Curl manages the actual `SSL_CTX` memory
-                    // - Curl will free the `SSL_CTX` during connection cleanup
-                    //
-                    // See: https://curl.se/libcurl/c/CURLOPT_SSL_CTX_FUNCTION.html
-                    std::mem::forget(ssl_ctx_builder);
-                }
-
-                Ok(())
-            })
-            .map_err(|err| RelayError::RequestRunError(err.description().to_string()))?;
-
-        transfer
-            .progress_function(|_dltotal, _dlnow, _ultotal, _ulnow| {
-                let cancelled = CANCELLED_REQUESTS
-                    .lock()
-                    .unwrap()
-                    .get(&req.req_id)
-                    .map(|flag| flag.load(Ordering::SeqCst))
-                    .unwrap_or(false);
-
-                if cancelled {
-                    cancel_token.cancel();
-                }
-                !cancelled
-            })
-            .map_err(|err| RelayError::RequestRunError(err.description().to_string()))?;
-
-        transfer
-            .header_function(|header| {
-                let header = String::from_utf8_lossy(header).into_owned();
-                if let Some((key, value)) = header.split_once(':') {
-                    response_headers.push(KeyValuePair {
-                        key: key.trim().to_string(),
-                        value: value.trim().to_string(),
+                    let url = s.trim_start_matches("Location:").trim().to_string();
+                    self.redirect_history.push(RedirectInfo {
+                        url: url.parse().unwrap(),
+                        status,
+                        headers,
                     });
                 }
-                true
-            })
-            .map_err(|err| RelayError::RequestRunError(err.description().to_string()))?;
-
-        transfer
-            .write_function(|data| {
-                response_body.extend_from_slice(data);
-                Ok(data.len())
-            })
-            .map_err(|err| RelayError::RequestRunError(err.description().to_string()))?;
-
-        let start_time_ms = SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis();
-
-        transfer
-            .perform()
-            .map_err(|err| RelayError::RequestRunError(err.description().to_string()))?;
-
-        let end_time_ms = SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis();
-
-        (start_time_ms, end_time_ms)
-    };
-
-    let response_status = curl_handle
-        .response_code()
-        .map_err(|err| RelayError::RequestRunError(err.description().to_string()))?
-        as u16;
-
-    Ok(ResponseWithMetadata {
-        status: response_status,
-        status_text: get_status_text(response_status).to_string(),
-        headers: response_headers,
-        data: response_body,
-        time_start_ms: start_time_ms,
-        time_end_ms: end_time_ms,
-    })
-}
-
-fn get_headers_list(req: &RequestWithMetadata) -> Result<List, RelayError> {
-    let mut result = List::new();
-
-    for KeyValuePair { key, value } in &req.headers {
-        result
-            .append(&format!("{}: {}", key, value))
-            .map_err(|err| RelayError::RequestRunError(err.description().to_string()))?;
+            }
+        }
+        true
     }
 
-    Ok(result)
-}
-
-fn apply_body_to_curl_handle(
-    curl_handle: &mut Easy,
-    req: &RequestWithMetadata,
-) -> Result<(), RelayError> {
-    match &req.body {
-        Some(BodyDef::Text(text)) => {
-            curl_handle
-                .post_fields_copy(text.as_bytes())
-                .map_err(|err| RelayError::RequestRunError(err.description().to_string()))?;
+    fn progress(&mut self, dltotal: f64, dlnow: f64, ultotal: f64, ulnow: f64) -> bool {
+        if dltotal > 0.0 {
+            self.handle_progress(dlnow as u64, Some(dltotal as u64), false);
         }
-        Some(BodyDef::FormData(entries)) => {
-            let mut form = curl::easy::Form::new();
+        if ultotal > 0.0 {
+            self.handle_progress(ulnow as u64, Some(ultotal as u64), true);
+        }
+        true
+    }
 
-            for entry in entries {
-                let mut part = form.part(&entry.key);
+    fn ssl_ctx(&mut self, ssl_ctx: *mut libc::c_void) -> Result<(), curl::Error> {
+        unsafe {
+            let ssl_ctx = ssl_ctx as *mut openssl_sys::SSL_CTX;
+            let ssl = openssl_sys::SSL_new(ssl_ctx);
 
-                match &entry.value {
-                    FormDataValue::Text(data) => {
-                        part.contents(data.as_bytes());
+            // Get TLS protocol version
+            let protocol = CStr::from_ptr(openssl_sys::SSL_get_version(ssl))
+                .to_string_lossy()
+                .into_owned();
+
+            // Get cipher
+            let cipher = CStr::from_ptr(openssl_sys::SSL_CIPHER_get_name(
+                openssl_sys::SSL_get_current_cipher(ssl),
+            ))
+            .to_string_lossy()
+            .into_owned();
+
+            // Get peer certificates
+            let mut certs = Vec::new();
+            let cert_chain = openssl_sys::SSL_get_peer_cert_chain(ssl);
+            if !cert_chain.is_null() {
+                let cert_count = openssl_sys::OPENSSL_sk_num(cert_chain as *mut _);
+
+                for i in 0..cert_count {
+                    let cert_ptr = openssl_sys::OPENSSL_sk_value(cert_chain as *mut _, i)
+                        as *mut openssl_sys::X509;
+
+                    if !cert_ptr.is_null() {
+                        let subject = todo!();
+                        let issuer = todo!();
+                        let valid_from = todo!();
+                        let valid_to = todo!();
+
+                        certs.push(CertificateInfo {
+                            subject,
+                            issuer,
+                            valid_from,
+                            valid_to,
+                        });
                     }
-                    FormDataValue::File {
-                        filename,
-                        data,
-                        mime,
-                    } => {
-                        part.buffer(filename, data.clone()).content_type(mime);
-                    }
-                };
-
-                part.add()
-                    .map_err(|err| RelayError::RequestRunError(err.description().to_string()))?;
+                }
             }
 
-            curl_handle
-                .httppost(form)
-                .map_err(|err| RelayError::RequestRunError(err.description().to_string()))?;
-        }
-        Some(BodyDef::URLEncoded(entries)) => {
-            let data = entries
-                .iter()
-                .map(|KeyValuePair { key, value }| {
-                    format!(
-                        "{}={}",
-                        &url_escape::encode_www_form_urlencoded(key),
-                        url_escape::encode_www_form_urlencoded(value)
-                    )
-                })
-                .collect::<Vec<String>>()
-                .join("&");
+            self.tls_info = Some(TlsConnectionInfo {
+                protocol,
+                cipher,
+                certificates: certs,
+            });
 
-            curl_handle
-                .post_fields_copy(data.as_bytes())
-                .map_err(|err| RelayError::RequestRunError(err.description().to_string()))?;
+            // Clean up
+            openssl_sys::SSL_free(ssl);
         }
-        None => {}
-    };
-
-    Ok(())
+        Ok(())
+    }
 }
 
-fn apply_ssl_config_to_curl_handle(
-    curl_handle: &mut Easy,
-    req: &RequestWithMetadata,
-) -> Result<(), RelayError> {
-    curl_handle
-        .ssl_verify_peer(req.validate_certs)
-        .map_err(|err| RelayError::RequestRunError(err.description().to_string()))?;
-
-    curl_handle
-        .ssl_verify_host(req.validate_certs)
-        .map_err(|err| RelayError::RequestRunError(err.description().to_string()))?;
-
-    Ok(())
+pub struct RequestManager {
+    multi: curl::multi::Multi,
+    handles: HashMap<String, curl::multi::Easy2Handle<RequestHandler>>,
+    retry_state: HashMap<String, RetryState>,
 }
 
-fn apply_client_cert_to_curl_handle(
-    handle: &mut Easy,
-    req: &RequestWithMetadata,
-) -> Result<(), RelayError> {
-    match &req.client_cert {
-        Some(ClientCertDef::PEMCert {
-            certificate_pem,
-            key_pem,
-        }) => {
-            handle
-                .ssl_cert_type("PEM")
-                .map_err(|err| RelayError::RequestRunError(err.description().to_string()))?;
+struct RetryState {
+    attempt: u32,
+    next_retry: SystemTime,
+}
 
-            handle
-                .ssl_cert_blob(certificate_pem)
-                .map_err(|err| RelayError::RequestRunError(err.description().to_string()))?;
-
-            handle
-                .ssl_key_type("PEM")
-                .map_err(|err| RelayError::RequestRunError(err.description().to_string()))?;
-
-            handle
-                .ssl_key_blob(key_pem)
-                .map_err(|err| RelayError::RequestRunError(err.description().to_string()))?;
+impl RequestManager {
+    pub fn new() -> Self {
+        RequestManager {
+            multi: curl::multi::Multi::new(),
+            handles: HashMap::new(),
+            retry_state: HashMap::new(),
         }
-        Some(ClientCertDef::PFXCert {
-            certificate_pfx,
-            password,
-        }) => {
-            let pkcs12 = Pkcs12::from_der(&certificate_pfx).map_err(|err| {
-                RelayError::RequestRunError(format!(
-                    "Failed to parse PFX certificate from DER: {}",
-                    err
-                ))
-            })?;
+    }
 
-            let parsed = pkcs12.parse2(password).map_err(|err| {
-                RelayError::RequestRunError(format!(
-                    "Failed to parse PFX certificate with provided password: {}",
-                    err
-                ))
-            })?;
+    fn configure_easy(
+        &self,
+        easy: &mut Easy2<RequestHandler>,
+        options: &RunOptions,
+    ) -> Result<(), RelayError> {
+        // Basic request setup
+        easy.url(&options.url).unwrap();
+        match options.method {
+            Method::Get => easy.get(true).unwrap(),
+            Method::Post => easy.post(true).unwrap(),
+            Method::Put => easy.put(true).unwrap(),
+            Method::Delete => easy.custom_request("DELETE").unwrap(),
+            Method::Patch => easy.custom_request("PATCH").unwrap(),
+            Method::Head => easy.custom_request("HEAD").unwrap(),
+            Method::Options => easy.custom_request("OPTIONS").unwrap(),
+            Method::Connect => easy.custom_request("CONNECT").unwrap(),
+            Method::Trace => easy.custom_request("TRACE").unwrap(),
+        }
 
-            if let (Some(cert), Some(key)) = (parsed.cert, parsed.pkey) {
-                let certificate_pem = cert.to_pem().map_err(|err| {
-                    RelayError::RequestRunError(format!(
-                        "Failed to convert PFX certificate to PEM format: {}",
-                        err
-                    ))
-                })?;
+        // Headers
+        if let Some(headers) = &options.headers {
+            let mut list = List::new();
+            for (key, values) in headers {
+                for value in values {
+                    list.append(&format!("{}: {}", key, value)).unwrap();
+                }
+            }
+            easy.http_headers(list).unwrap();
+        }
 
-                let key_pem = key.private_key_to_pem_pkcs8().map_err(|err| {
-                    RelayError::RequestRunError(format!(
-                        "Failed to convert PFX private key to PEM format: {}",
-                        err
-                    ))
-                })?;
+        // Content handling
+        if let Some(content) = &options.content {
+            match content {
+                ContentType::Text {
+                    content,
+                    media_type,
+                } => {
+                    easy.post_field_size(content.len() as u64).unwrap();
+                    easy.post_fields_copy(content.as_bytes()).unwrap();
+                    if let Some(media_type) = media_type {
+                        let mut list = List::new();
+                        list.append(&format!("Content-Type: {}", media_type))
+                            .unwrap();
+                        easy.http_headers(list).unwrap();
+                    }
+                }
+                ContentType::Json(value) => {
+                    let content = serde_json::to_string(value).unwrap();
+                    easy.post_field_size(content.len() as u64).unwrap();
+                    easy.post_fields_copy(content.as_bytes()).unwrap();
+                    let mut list = List::new();
+                    list.append("Content-Type: application/json").unwrap();
+                    easy.http_headers(list).unwrap();
+                }
+                ContentType::Form(form_data) => {
+                    let mut form = curl::easy::Form::new();
+                    for (key, value) in form_data {
+                        form.part(key).contents(value.as_bytes()).add().unwrap();
+                    }
+                    easy.httppost(form).unwrap();
+                }
+                ContentType::Binary {
+                    content,
+                    media_type,
+                } => {
+                    easy.post_field_size(content.len() as u64).unwrap();
+                    easy.post_fields_copy(content).unwrap();
+                    if let Some(media_type) = media_type {
+                        let mut list = List::new();
+                        list.append(&format!("Content-Type: {}", media_type))
+                            .unwrap();
+                        easy.http_headers(list).unwrap();
+                    }
+                }
+                ContentType::Multipart(parts) => {
+                    let mut form = curl::easy::Form::new();
+                    for (name, data) in parts {
+                        form.part(&name).buffer(&name, data.to_vec()).add().unwrap();
+                    }
+                    easy.httppost(form).unwrap();
+                }
+                ContentType::Urlencoded(params) => {
+                    let content = form_urlencoded::Serializer::new(String::new())
+                        .extend_pairs(params)
+                        .finish();
+                    easy.post_field_size(content.len() as u64).unwrap();
+                    easy.post_fields_copy(content.as_bytes()).unwrap();
+                    let mut list = List::new();
+                    list.append("Content-Type: application/x-www-form-urlencoded")
+                        .unwrap();
+                    easy.http_headers(list).unwrap();
+                }
+                ContentType::Stream(_stream) => {
+                    // For streaming content, we need to set up a read callback
+                    // This is a simplified example - proper implementation would need
+                    // to handle backpressure and async streams
+                    return Err(RelayError::UnsupportedContent);
+                }
+            }
+        }
 
-                handle
-                    .ssl_cert_type("PEM")
-                    .map_err(|err| RelayError::RequestRunError(err.description().to_string()))?;
+        // Authentication
+        if let Some(auth) = &options.auth {
+            match auth {
+                AuthType::None => {}
+                AuthType::Basic { username, password } => {
+                    easy.username(username).unwrap();
+                    easy.password(password).unwrap();
+                    easy.http_auth(&curl::easy::Auth::new().basic(true))
+                        .unwrap();
+                }
+                AuthType::Bearer { token } => {
+                    let mut list = List::new();
+                    list.append(&format!("Authorization: Bearer {}", token))
+                        .unwrap();
+                    easy.http_headers(list).unwrap();
+                }
+                AuthType::Digest {
+                    username,
+                    password,
+                    realm: _,
+                    nonce: _,
+                    opaque: _,
+                    algorithm: _,
+                    qop: _,
+                } => {
+                    easy.username(username).unwrap();
+                    easy.password(password).unwrap();
+                    easy.http_auth(&curl::easy::Auth::new().digest(true))
+                        .unwrap();
+                }
+                AuthType::OAuth2 {
+                    access_token,
+                    token_type,
+                    refresh_token: _,
+                } => {
+                    let mut list = List::new();
+                    let token_type = token_type.as_deref().unwrap_or("Bearer");
+                    list.append(&format!("Authorization: {} {}", token_type, access_token))
+                        .unwrap();
+                    easy.http_headers(list).unwrap();
+                }
+                AuthType::ApiKey {
+                    key,
+                    r#in: location,
+                    name,
+                } => match location {
+                    ApiKeyLocation::Header => {
+                        let mut list = List::new();
+                        list.append(&format!("{}: {}", name, key)).unwrap();
+                        easy.http_headers(list).unwrap();
+                    }
+                    ApiKeyLocation::Query => {
+                        let url = if options.url.contains('?') {
+                            format!("{}&{}={}", options.url, name, key)
+                        } else {
+                            format!("{}.unwrap(){}={}", options.url, name, key)
+                        };
+                        easy.url(&url).unwrap();
+                    }
+                },
+            }
+        }
 
-                handle
-                    .ssl_cert_blob(&certificate_pem)
-                    .map_err(|err| RelayError::RequestRunError(err.description().to_string()))?;
+        // Security configuration
+        if let Some(security) = &options.security {
+            if let Some(certs) = &security.certificates {
+                // Client certificate handling
+                if let Some(client_cert) = &certs.client {
+                    match client_cert {
+                        CertificateType::Pem { cert, key } => {
+                            easy.ssl_cert_blob(cert).unwrap();
+                            easy.ssl_key_blob(key).unwrap();
+                        }
+                        CertificateType::Pfx { data, password } => {
+                            // Parse PKCS#12 data
+                            let pkcs12 = Pkcs12::from_der(data)
+                                .and_then(|p| p.parse2(password))
+                                .unwrap();
 
-                handle
-                    .ssl_key_type("PEM")
-                    .map_err(|err| RelayError::RequestRunError(err.description().to_string()))?;
+                            // Convert to PEM format for curl
+                            let pem_cert = pkcs12.cert.unwrap().to_pem().unwrap();
+                            let pem_key = pkcs12.pkey.unwrap().private_key_to_pem_pkcs8().unwrap();
 
-                handle
-                    .ssl_key_blob(&key_pem)
-                    .map_err(|err| RelayError::RequestRunError(err.description().to_string()))?;
+                            easy.ssl_cert_blob(&pem_cert).unwrap();
+                            easy.ssl_key_blob(&pem_key).unwrap();
+                        }
+                    }
+                }
+
+                // CA certificates
+                if let Some(ca_certs) = &certs.ca {
+                    for cert in ca_certs {
+                        easy.ssl_cainfo_blob(cert).unwrap();
+                    }
+                }
+            }
+
+            easy.ssl_verify_peer(security.validate_certificates)
+                .unwrap();
+            easy.ssl_verify_host(security.verify_host).unwrap();
+        }
+
+        // Request options
+        if let Some(options) = &options.options {
+            if let Some(timeout) = options.timeout {
+                easy.timeout(timeout).unwrap();
+            }
+            if let Some(timeout) = options.timeout_connect {
+                easy.connect_timeout(timeout).unwrap();
+            }
+            if let Some(_timeout) = options.timeout_tls {
+                // TLS timeout is not directly supported by curl-rust,
+                // would need custom implementation
+            }
+            if let Some(follow) = options.follow_redirects {
+                easy.follow_location(follow).unwrap();
+            }
+            if let Some(max) = options.max_redirects {
+                easy.max_redirections(max).unwrap();
+            }
+            if let Some(decompress) = options.decompress {
+                easy.http_content_decoding(decompress).unwrap();
+            }
+            if let Some(keep_alive) = options.keep_alive {
+                easy.tcp_keepalive(keep_alive).unwrap();
+                if keep_alive {
+                    // Set reasonable defaults for keepalive settings
+                    easy.tcp_keepidle(Duration::from_secs(120)).unwrap();
+                    easy.tcp_keepintvl(Duration::from_secs(60)).unwrap();
+                }
+            }
+            if let Some(tcp_nodelay) = options.tcp_no_delay {
+                easy.tcp_nodelay(tcp_nodelay).unwrap();
+            }
+            if let Some(ip_version) = &options.ip_version {
+                match ip_version {
+                    IpVersion::V4 => easy.ip_resolve(curl::easy::IpResolve::V4).unwrap(),
+                    IpVersion::V6 => easy.ip_resolve(curl::easy::IpResolve::V6).unwrap(),
+                    IpVersion::Any => easy.ip_resolve(curl::easy::IpResolve::Any).unwrap(),
+                }
+            }
+        }
+
+        // Proxy configuration
+        if let Some(proxy) = &options.proxy {
+            easy.proxy(proxy.url.as_str()).unwrap();
+
+            if let Some(auth) = &proxy.auth {
+                easy.proxy_username(&auth.username).unwrap();
+                easy.proxy_password(&auth.password).unwrap();
+            }
+
+            if let Some(certs) = &proxy.certificates {
+                if let Some(ca) = &certs.ca {
+                    easy.proxy_ssl_cainfo_blob(ca).unwrap();
+                }
+                if let Some(client_cert) = &certs.client {
+                    match client_cert {
+                        CertificateType::Pem { cert, key } => {
+                            easy.proxy_sslcert_blob(cert).unwrap();
+                            easy.proxy_sslkey_blob(key).unwrap();
+                        }
+                        CertificateType::Pfx { data, password } => {
+                            let pkcs12 = Pkcs12::from_der(data)
+                                .and_then(|p| p.parse2(password))
+                                .map_err(|_| RelayError::CertificateError)
+                                .unwrap();
+
+                            let pem_cert = pkcs12.cert.unwrap().to_pem().unwrap();
+                            let pem_key = pkcs12.pkey.unwrap().private_key_to_pem_pkcs8().unwrap();
+
+                            easy.proxy_sslcert_blob(&pem_cert).unwrap();
+                            easy.proxy_sslkey_blob(&pem_key).unwrap();
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn create_response(
+        &self,
+        easy: &Easy2<RequestHandler>,
+        handler: &RequestHandler,
+    ) -> Result<RunResponse, RelayError> {
+        let end_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        // Determine content type and structure
+        let content = match String::from_utf8(handler.data.clone()) {
+            Ok(text) => {
+                // Try to parse as JSON if content type indicates JSON
+                if easy
+                    .content_type()
+                    .map(|ct| ct.unwrap().contains("application/json"))
+                    .unwrap_or(false)
+                {
+                    if let Ok(json) = serde_json::from_str(&text) {
+                        ContentType::Json(json)
+                    } else {
+                        ContentType::Text {
+                            content: text,
+                            media_type: easy.content_type().unwrap().map(String::from),
+                        }
+                    }
+                } else {
+                    ContentType::Text {
+                        content: text,
+                        media_type: easy.content_type().unwrap().map(String::from),
+                    }
+                }
+            }
+            Err(_) => ContentType::Binary {
+                content: handler.data.clone(),
+                media_type: easy.content_type().unwrap().map(String::from),
+            },
+        };
+
+        // Get timing information
+        let total_time = easy.total_time().unwrap();
+        let connect_time = easy.connect_time().unwrap();
+        let pretransfer_time = easy.pretransfer_time().unwrap();
+        let starttransfer_time = easy.starttransfer_time().unwrap();
+
+        // Convert TLS information if available
+        let tls = handler.tls_info.as_ref().map(|info| TlsInfo {
+            protocol: info.protocol.clone(),
+            cipher: info.cipher.clone(),
+            certificates: Some(info.certificates.clone()),
+        });
+
+        // Build response
+        Ok(RunResponse {
+            status: easy.response_code().unwrap() as u16,
+            status_text: http_status_text(easy.response_code().unwrap() as u16),
+            headers: parse_headers(&handler.headers),
+            content,
+            meta: ResponseMeta {
+                timing: TimingInfo {
+                    start: handler.start_time,
+                    end: end_time,
+                    phases: Some(TimingPhases {
+                        dns: Some(easy.namelookup_time().unwrap().as_millis() as i64),
+                        connect: Some(connect_time.as_millis() as i64),
+                        tls: easy.appconnect_time().ok().map(|t| t.as_millis() as i64),
+                        send: Some((pretransfer_time - connect_time).as_millis() as i64),
+                        wait: Some((starttransfer_time - pretransfer_time).as_millis() as i64),
+                        receive: Some((total_time - starttransfer_time).as_millis() as i64),
+                    }),
+                    total: total_time.as_millis() as i64,
+                },
+                size: SizeInfo {
+                    headers: easy.header_size().unwrap(),
+                    body: handler.received_bytes,
+                    total: easy.header_size().unwrap() + handler.received_bytes,
+                },
+                tls,
+                redirects: if handler.redirect_history.is_empty() {
+                    None
+                } else {
+                    Some(handler.redirect_history.clone())
+                },
+            },
+        })
+    }
+
+    fn should_retry(
+        &self,
+        options: &RunOptions,
+        response: &Result<RunResponse, RelayError>,
+    ) -> bool {
+        if let Some(retry_config) = options.options.as_ref().and_then(|o| o.retry.as_ref()) {
+            if let Some(state) = self.retry_state.get(&options.id) {
+                if state.attempt >= retry_config.count {
+                    return false;
+                }
+
+                match response {
+                    Ok(resp) => {
+                        // Retry on 5xx status codes
+                        resp.status >= 500 && resp.status < 600
+                    }
+                    Err(RelayError::Curl(err)) => {
+                        // Retry on network errors
+                        err.is_operation_timedout()
+                            || err.is_couldnt_connect()
+                            || err.is_recv_error()
+                            || err.is_send_error()
+                    }
+                    _ => false,
+                }
             } else {
-                return Err(RelayError::RequestRunError(
-                    "PFX certificate parsing succeeded, but either cert or private key is missing"
-                        .to_string(),
-                ));
+                true // First attempt
             }
-        }
-        None => {}
-    };
-
-    Ok(())
-}
-
-fn get_x509_certs_from_root_cert_bundle_safe(
-    req: &RequestWithMetadata,
-) -> Result<Vec<X509>, openssl::error::ErrorStack> {
-    let mut certs = Vec::new();
-
-    for pem_bundle in &req.root_cert_bundle_files {
-        if let Ok(mut bundle_certs) = X509::stack_from_pem(pem_bundle) {
-            certs.append(&mut bundle_certs);
+        } else {
+            false // No retry config
         }
     }
 
-    Ok(certs)
-}
+    pub fn run(&mut self, options: RunOptions) -> Result<RunResponse, RelayError> {
+        let mut result = None;
 
-fn apply_proxy_config_to_curl_handle(
-    handle: &mut Easy,
-    req: &RequestWithMetadata,
-) -> Result<(), RelayError> {
-    if let Some(proxy_config) = &req.proxy {
-        handle
-            .proxy_auth(curl::easy::Auth::new().auto(true))
-            .map_err(|err| RelayError::RequestRunError(err.description().to_string()))?;
+        loop {
+            let handler = RequestHandler::new(None);
+            let mut easy = Easy2::new(handler);
+            self.configure_easy(&mut easy, &options).unwrap();
 
-        handle
-            .proxy(&proxy_config.url)
-            .map_err(|err| RelayError::RequestRunError(err.description().to_string()))?;
+            let handle = self.multi.add2(easy).unwrap();
+            self.handles.insert(options.id.clone(), handle);
+
+            while self.multi.perform().unwrap() > 0 {
+                let mut fds = Vec::new();
+                self.multi.wait(&mut fds, Duration::from_secs(1)).unwrap();
+            }
+
+            if let Some(handle) = self.handles.remove(&options.id) {
+                let easy = self.multi.remove2(handle).unwrap();
+                let handler = easy.get_ref();
+                result = Some(self.create_response(&easy, handler));
+
+                if let Some(retry_config) = options.options.as_ref().and_then(|o| o.retry.as_ref())
+                {
+                    let result = result.clone().unwrap();
+                    if self.should_retry(&options, &result) {
+                        let state =
+                            self.retry_state
+                                .entry(options.id.clone())
+                                .or_insert(RetryState {
+                                    attempt: 0,
+                                    next_retry: SystemTime::now(),
+                                });
+
+                        state.attempt += 1;
+                        state.next_retry = SystemTime::now() + retry_config.interval;
+
+                        std::thread::sleep(retry_config.interval);
+                        continue;
+                    }
+                }
+            }
+
+            break;
+        }
+
+        self.retry_state.remove(&options.id);
+        result.unwrap_or(Err(RelayError::RequestNotFound))
     }
 
-    Ok(())
+    pub fn subscribe(
+        &mut self,
+        options: SubscribeOptions,
+    ) -> Result<SubscribeResponse, RelayError> {
+        // Configure callbacks for the multi handle
+        self.multi
+            .socket_function(move |_socket, events, _token| {
+                if events.input() {
+                    (options.callbacks.on_state_change)(StateChangeEvent {
+                        state: RequestState::Receiving,
+                    });
+                } else if events.output() {
+                    (options.callbacks.on_state_change)(StateChangeEvent {
+                        state: RequestState::Sending,
+                    });
+                }
+            })
+            .unwrap();
+
+        // Return unsubscribe handle
+        Ok(SubscribeResponse {
+            unsubscribe: Box::new(move || {
+                // Cleanup subscription resources
+            }),
+        })
+    }
+
+    pub fn cancel(&mut self, options: CancelOptions) -> Result<(), RelayError> {
+        if let Some(handle) = self.handles.remove(&options.request_id) {
+            self.multi.remove2(handle).unwrap();
+            self.retry_state.remove(&options.request_id);
+            Ok(())
+        } else {
+            Err(RelayError::RequestNotFound)
+        }
+    }
+}
+
+fn parse_headers(raw_headers: &[String]) -> HashMap<String, Vec<String>> {
+    let mut headers = HashMap::new();
+    for header in raw_headers {
+        if let Some((key, value)) = header.split_once(':') {
+            headers
+                .entry(key.trim().to_string())
+                .or_insert_with(Vec::new)
+                .push(value.trim().to_string());
+        }
+    }
+    headers
+}
+
+fn http_status_text(code: u16) -> String {
+    match code {
+        100 => "Continue",
+        101 => "Switching Protocols",
+        200 => "OK",
+        201 => "Created",
+        202 => "Accepted",
+        203 => "Non-Authoritative Information",
+        204 => "No Content",
+        205 => "Reset Content",
+        206 => "Partial Content",
+        300 => "Multiple Choices",
+        301 => "Moved Permanently",
+        302 => "Found",
+        303 => "See Other",
+        304 => "Not Modified",
+        305 => "Use Proxy",
+        307 => "Temporary Redirect",
+        308 => "Permanent Redirect",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        402 => "Payment Required",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        406 => "Not Acceptable",
+        407 => "Proxy Authentication Required",
+        408 => "Request Timeout",
+        409 => "Conflict",
+        410 => "Gone",
+        411 => "Length Required",
+        412 => "Precondition Failed",
+        413 => "Payload Too Large",
+        414 => "URI Too Long",
+        415 => "Unsupported Media Type",
+        416 => "Range Not Satisfiable",
+        417 => "Expectation Failed",
+        422 => "Unprocessable Entity",
+        428 => "Precondition Required",
+        429 => "Too Many Requests",
+        431 => "Request Header Fields Too Large",
+        500 => "Internal Server Error",
+        501 => "Not Implemented",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        504 => "Gateway Timeout",
+        505 => "HTTP Version Not Supported",
+        511 => "Network Authentication Required",
+        _ => "Unknown Status Code",
+    }
+    .to_string()
 }

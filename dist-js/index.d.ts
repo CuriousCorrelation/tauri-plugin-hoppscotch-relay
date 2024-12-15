@@ -58,8 +58,8 @@ export type ContentType = {
     content: ReadableStream;
     mediaType: string;
 };
-export interface ResponseBody<T = unknown> {
-    body: T;
+export interface ResponseBody {
+    body: Uint8Array;
     mediaType: MediaType | string;
 }
 export type AuthType = {
